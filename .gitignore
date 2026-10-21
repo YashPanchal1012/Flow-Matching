@@ -23,4 +23,6 @@ flow_matching_concepts.ipynb
 *.pdf
 *.png
 .jpeg
-log.md
+log.txt
+Report/
+.vscode/
