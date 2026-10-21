@@ -1,0 +1,26 @@
+﻿# Byte-compiled / optimized / Jupyter
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environments
+.conda/
+.venv/
+env/
+
+# Datasets & Generated Artifacts
+data/
+flow_matching_examples/
+*.npy
+*.pth
+checkpoint*.pt
+
+# course stuff
+mnist_classifier.pt
+flow_matching_concepts.ipynb
+
+# Anything else
+*.pdf
+*.png
+.jpeg
+log.md
