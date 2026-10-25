@@ -18,32 +18,49 @@ from PIL import Image, ImageDraw, ImageFont
 # ============================================================================
 
 class Block(nn.Module):
-    """Two 3x3 convolutions with time offset added after the first."""
+    """Two 3x3 convolutions with GroupNorm and residual projection."""
     def __init__(self, cin: int, cout: int, tdim: int):
         super().__init__()
         self.c1 = nn.Conv2d(cin, cout, 3, padding=1)
         self.c2 = nn.Conv2d(cout, cout, 3, padding=1)
+        self.norm = nn.GroupNorm(4, cout)
         self.t = nn.Linear(tdim, cout)
+        self.proj = nn.Conv2d(cin, cout, 1) if cin != cout else nn.Identity()
+        nn.init.zeros_(self.c2.weight)
+        nn.init.zeros_(self.c2.bias)
 
     def forward(self, x: torch.Tensor, te: torch.Tensor) -> torch.Tensor:
-        h = self.c1(x) + self.t(te)[:, :, None, None]
-        return F.relu(self.c2(F.relu(h)))
+        h = self.norm(self.c1(x)) + self.t(te)[:, :, None, None]
+        change = self.c2(F.silu(h))
+        return self.proj(x) + change
+
+
+class Level(nn.Module):
+    """Two blocks in a row; the first changes the channel count."""
+    def __init__(self, cin: int, cout: int, tdim: int):
+        super().__init__()
+        self.b1 = Block(cin, cout, tdim)
+        self.b2 = Block(cout, cout, tdim)
+
+    def forward(self, x: torch.Tensor, te: torch.Tensor) -> torch.Tensor:
+        return self.b2(self.b1(x, te), te)
 
 
 class UNet(nn.Module):
-    """Flow matching velocity field UNet for 28x28 grayscale images."""
-    def __init__(self, width: int = 16, tdim: int = 32):
+    """Flow matching velocity field UNet for 28x28 grayscale images (Trial 20)."""
+    def __init__(self, width: int = 64, tdim: int = 32):
         super().__init__()
         c = width
         self.register_buffer("freq", torch.exp(torch.linspace(0, math.log(1000), tdim // 2)))
         self.temb = nn.Sequential(nn.Linear(tdim, tdim), nn.SiLU(), nn.Linear(tdim, tdim))
-        self.down1 = Block(1, c, tdim)                    # 28 x 28
-        self.down2 = Block(c, 2 * c, tdim)                # 14 x 14
-        self.mid = Block(2 * c, 4 * c, tdim)              # 7 x 7
+
+        self.down1 = Level(1, c, tdim)                    # 28 x 28
+        self.down2 = Level(c, 2 * c, tdim)                # 14 x 14
+        self.mid = Level(2 * c, 4 * c, tdim)              # 7 x 7
         self.up2 = nn.ConvTranspose2d(4 * c, 2 * c, 2, stride=2)
-        self.dec2 = Block(4 * c, 2 * c, tdim)
+        self.dec2 = Level(4 * c, 2 * c, tdim)
         self.up1 = nn.ConvTranspose2d(2 * c, c, 2, stride=2)
-        self.dec1 = Block(2 * c, c, tdim)
+        self.dec1 = Level(2 * c, c, tdim)
         self.out = nn.Conv2d(c, 1, 1)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -62,7 +79,7 @@ class UNet(nn.Module):
 # 2. Global State & Model Cache (Load Once)
 # ============================================================================
 
-DEFAULT_CKPT = r"C:\MyFiles\UMN Notes\CSCI 5561\Flow-Matching\flow_matching_examples\checkpoints\checkpoint.pt"
+DEFAULT_CKPT = r"C:\MyFiles\UMN Notes\CSCI 5561\Flow-Matching\Report\Results\trial20-checkpoint.pt"
 CLASSIFIER_PATH = r"mnist_classifier.pt"
 
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -98,7 +115,7 @@ def load_model(ckpt_path: str = DEFAULT_CKPT) -> Tuple[UNet, str]:
 
     print(f"[Info] Loading flow matching checkpoint from {norm_path} on {dev} (one-time load)...")
     ckpt = torch.load(norm_path, map_location=dev)
-    model = UNet(width=16, tdim=32).to(dev)
+    model = UNet(width=64, tdim=32).to(dev)
 
     if isinstance(ckpt, dict) and "net" in ckpt:
         model.load_state_dict(ckpt["net"])
@@ -138,7 +155,6 @@ def generate_samples(
     step_count: int,
     solver: str = "Euler",
     noise_scale: float = 1.0,
-    time_schedule_gamma: float = 1.0,
     num_samples: int = 16,
     record_trajectory: bool = False,
 ) -> Tuple[torch.Tensor, Optional[List[Tuple[float, torch.Tensor]]]]:
@@ -150,10 +166,9 @@ def generate_samples(
     x = torch.randn(num_samples, 1, 28, 28, generator=g, device=dev) * float(noise_scale)
 
     N = max(1, int(step_count))
-    gamma = float(time_schedule_gamma)
 
-    # Discretization grid in [0, 1]
-    time_steps = [(i / N) ** gamma for i in range(N + 1)]
+    # Uniform discretization grid in [0, 1]
+    time_steps = [i / N for i in range(N + 1)]
 
     trajectory: List[Tuple[float, torch.Tensor]] = []
     if record_trajectory:
@@ -363,7 +378,6 @@ def run_sampler(
     step_count: int,
     solver: str,
     noise_scale: float,
-    time_schedule_gamma: float,
     num_samples_choice: int,
     highlight_low_conf: bool,
     show_labels: bool,
@@ -392,7 +406,6 @@ def run_sampler(
             step_count=int(step_count),
             solver=solver,
             noise_scale=float(noise_scale),
-            time_schedule_gamma=float(time_schedule_gamma),
             num_samples=int(num_samples_choice),
             record_trajectory=bool(show_trajectory),
         )
@@ -431,7 +444,7 @@ def run_sampler(
 - **Recognition Score (Conf > 0.99)**: `{rec_rate * 100:.1f}%`
 - **Low-Confidence Samples (<= 0.99)**: `{low_conf_count} / {len(samples_net)}` *(red borders in grid)*
 - **Integration Latency**: `{latency_ms:.1f} ms` on `{get_device().upper()}`
-- **ODE Solver**: `{solver}` with `{step_count}` steps | **Noise $\sigma$**: `{noise_scale}`
+- **Sampler**: `{solver}` with `{step_count}` steps | Noise σ = `{noise_scale}`
 - **Digit Counts [0-9]**: `{counts}`
     """
 
@@ -496,9 +509,6 @@ def create_ui() -> gr.Blocks:
             <h1 style="margin: 0; font-size: 28px; font-weight: 700; display: flex; align-items: center; gap: 10px;">
                 Flow Matching Interactive Sampler
             </h1>
-            <p style="margin: 8px 0 0 0; opacity: 0.85; font-size: 15px;">
-                CSCI 5561 Generative AI for Images &bull; Interactive ODE Sampling & Diagnostic Suite
-            </p>
         </div>
         """)
 
@@ -561,15 +571,6 @@ def create_ui() -> gr.Blocks:
                         info="Scale factor for initial Gaussian noise x_0 ~ N(0, σ²I)",
                     )
 
-                    # schedule_slider = gr.Slider(
-                    #     minimum=0.2,
-                    #     maximum=3.0,
-                    #     value=1.0,
-                    #     step=0.1,
-                    #     label="Time Warping Exponent (γ)",
-                    #     info="t_i = (i / N)^γ (1.0 = uniform; >1.0 concentrates steps near clean data)",
-                    # )
-
                     samples_dropdown = gr.Dropdown(
                         choices=[1, 4, 9, 16, 25, 36, 64],
                         value=16,
@@ -620,7 +621,7 @@ def create_ui() -> gr.Blocks:
                     with gr.TabItem("Flow Trajectory (t: 0 → 1)"):
                         gr.Markdown(
                             "<p style='margin: 4px 0 6px 0; font-size: 13px; color: #94a3b8;'>"
-                            "Reverse Vector Field Trajectory Evolution ($t = 0.00$ Noise &rarr; $t = 1.00$ Digit)"
+                            "Reverse Vector Field Trajectory Evolution (t = 0 Noise &rarr; t = 1 Digit)"
                             "</p>"
                         )
                         traj_output = gr.Image(
@@ -659,7 +660,6 @@ def create_ui() -> gr.Blocks:
                 step_slider,
                 solver_dropdown,
                 noise_slider,
-                schedule_slider,
                 samples_dropdown,
                 highlight_box,
                 labels_box,
@@ -682,7 +682,6 @@ def create_ui() -> gr.Blocks:
                 step_slider,
                 solver_dropdown,
                 noise_slider,
-                schedule_slider,
                 samples_dropdown,
                 highlight_box,
                 labels_box,
