@@ -79,8 +79,22 @@ class UNet(nn.Module):
 # 2. Global State & Model Cache (Load Once)
 # ============================================================================
 
-DEFAULT_CKPT = r"C:\MyFiles\UMN Notes\CSCI 5561\Flow-Matching\Report\Results\trial20-checkpoint.pt"
-CLASSIFIER_PATH = r"mnist_classifier.pt"
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_CKPT_CANDIDATES = [
+    _SCRIPT_DIR / "trial20-checkpoint.pt",
+    _SCRIPT_DIR / "Report" / "Results" / "trial20-checkpoint.pt",
+    _SCRIPT_DIR.parent / "Report" / "Results" / "trial20-checkpoint.pt",
+    Path("trial20-checkpoint.pt"),
+    Path("Report/Results/trial20-checkpoint.pt"),
+]
+DEFAULT_CKPT = str(next((p for p in _CKPT_CANDIDATES if p.exists()), _CKPT_CANDIDATES[0]))
+
+_CLF_CANDIDATES = [
+    _SCRIPT_DIR / "mnist_classifier.pt",
+    _SCRIPT_DIR.parent / "mnist_classifier.pt",
+    Path("mnist_classifier.pt"),
+]
+CLASSIFIER_PATH = str(next((p for p in _CLF_CANDIDATES if p.exists()), _CLF_CANDIDATES[0]))
 
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _MODEL_CACHE: Dict[str, nn.Module] = {}

@@ -27,13 +27,16 @@ Run the respective cells in `main.ipynb`:
 ## 3. Loading a Checkpoint
 
 ```python
+import os
 import torch
 
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 net = UNet(width=64, tdim=32).to(dev)
 
-ckpt = torch.load("Report/Results/trial20-checkpoint.pt", map_location=dev)
-net.load_state_dict(ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt)
+ckpt_path = "trial20-checkpoint.pt" if os.path.exists("trial20-checkpoint.pt") else "Report/Results/trial20-checkpoint.pt"
+ckpt = torch.load(ckpt_path, map_location=dev)
+state = ckpt["net"] if isinstance(ckpt, dict) and "net" in ckpt else ckpt
+net.load_state_dict(state)
 net.eval()
 ```
 
