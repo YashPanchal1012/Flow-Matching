@@ -1,4 +1,4 @@
-﻿# Byte-compiled / optimized / Jupyter
+# Byte-compiled / optimized / Jupyter
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
@@ -15,14 +15,16 @@ flow_matching_examples/
 *.pth
 checkpoint*.pt
 
-# course stuff
-mnist_classifier.pt
-flow_matching_concepts.ipynb
+# Model Checkpoints tracked via Git LFS
+!trial20-checkpoint.pt
+!mnist_classifier.pt
+!requirements.txt
 
-# Anything else
+# Course stuff & large artifacts
+flow_matching_concepts.ipynb
 *.pdf
 *.png
-.jpeg
+*.jpeg
 log.txt
 Report/
 .vscode/

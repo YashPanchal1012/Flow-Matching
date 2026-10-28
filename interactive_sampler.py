@@ -1,8 +1,19 @@
+# 0. Hugging Face ZeroGPU compatibility: MUST be imported before torch or any CUDA library!
+try:
+    import spaces
+except ImportError:
+    class spaces:
+        @staticmethod
+        def GPU(fn=None, **kwargs):
+            if fn is None:
+                return lambda f: f
+            return fn
+
 import math
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 import numpy as np
@@ -103,7 +114,7 @@ _CLASSIFIER: Optional[torch.jit.ScriptModule] = None
 
 
 def get_device() -> str:
-    return _DEVICE
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def get_classifier() -> Optional[torch.jit.ScriptModule]:
@@ -122,7 +133,11 @@ def load_model(ckpt_path: str = DEFAULT_CKPT) -> Tuple[UNet, str]:
     dev = get_device()
 
     if norm_path in _MODEL_CACHE:
-        return _MODEL_CACHE[norm_path], _MODEL_METADATA.get(norm_path, "")
+        model = _MODEL_CACHE[norm_path]
+        first_param = next(model.parameters(), None)
+        if first_param is not None and first_param.device.type != dev:
+            model.to(dev)
+        return model, _MODEL_METADATA.get(norm_path, "")
 
     if not os.path.exists(norm_path):
         raise FileNotFoundError(f"Checkpoint not found at: {norm_path}")
@@ -387,6 +402,7 @@ def render_trajectory_filmstrip(
 # 5. Core Interactive Handler
 # ============================================================================
 
+@spaces.GPU
 def run_sampler(
     seed: int,
     step_count: int,
@@ -397,6 +413,7 @@ def run_sampler(
     show_labels: bool,
     show_trajectory: bool,
     ckpt_path: str,
+    uploaded_ckpt: Optional[Any] = None,
 ) -> Tuple[Image.Image, Optional[Image.Image], str, str]:
     """
     Main callback invoked by Gradio. Loads checkpoint once, generates samples,
@@ -404,13 +421,25 @@ def run_sampler(
     """
     start_time = time.time()
 
+    # Determine which checkpoint to use
+    if uploaded_ckpt is not None:
+        target_path = uploaded_ckpt.name if hasattr(uploaded_ckpt, "name") else str(uploaded_ckpt)
+    else:
+        target_path = ckpt_path
+
     # 1. Fetch model from cache (load once)
     try:
-        model, meta = load_model(ckpt_path)
+        model, meta = load_model(target_path)
     except Exception as e:
         err_msg = f"Error loading checkpoint: {str(e)}"
         empty_img = Image.new("RGB", (200, 200), color=(40, 20, 20))
         return empty_img, None, err_msg, ""
+
+    # Ensure model is on active device (moves to CUDA inside @spaces.GPU)
+    dev = get_device()
+    first_p = next(model.parameters(), None)
+    if first_p is not None and first_p.device.type != dev:
+        model.to(dev)
 
     # 2. Generate samples via ODE integration
     try:
@@ -533,9 +562,14 @@ def create_ui() -> gr.Blocks:
 
                 # Checkpoint Accordion
                 with gr.Accordion("📁 Model Checkpoint Settings", open=False):
+                    ckpt_upload = gr.File(
+                        file_count="single",
+                        file_types=[".pt"],
+                        label="Upload Custom Checkpoint (.pt)",
+                    )
                     ckpt_input = gr.Textbox(
                         value=DEFAULT_CKPT,
-                        label="Checkpoint Path (.pt)",
+                        label="Default Checkpoint Path (.pt)",
                         info="Points to the trained flow matching weights",
                     )
                     with gr.Row():
@@ -661,6 +695,22 @@ def create_ui() -> gr.Blocks:
 
         randomize_btn.click(fn=randomize_seed, outputs=seed_slider)
 
+        def handle_ckpt_upload(uploaded_file):
+            if not uploaded_file:
+                return f"Device: `{get_device().upper()}` | Using default: `{Path(DEFAULT_CKPT).name}`"
+            path = uploaded_file.name if hasattr(uploaded_file, "name") else str(uploaded_file)
+            try:
+                _, meta = load_model(path)
+                return f"✅ Loaded custom checkpoint: `{Path(path).name}` | {meta}"
+            except Exception as e:
+                return f"❌ Failed to load custom checkpoint: {e}"
+
+        ckpt_upload.change(
+            fn=handle_ckpt_upload,
+            inputs=[ckpt_upload],
+            outputs=[ckpt_status],
+        )
+
         reload_btn.click(
             fn=reload_checkpoint_handler,
             inputs=[ckpt_input],
@@ -679,6 +729,7 @@ def create_ui() -> gr.Blocks:
                 labels_box,
                 trajectory_box,
                 ckpt_input,
+                ckpt_upload,
             ],
             outputs=[
                 grid_output,
@@ -701,6 +752,7 @@ def create_ui() -> gr.Blocks:
                 labels_box,
                 trajectory_box,
                 ckpt_input,
+                ckpt_upload,
             ],
             outputs=[
                 grid_output,
@@ -717,10 +769,12 @@ if __name__ == "__main__":
     # Standalone entrypoint
     demo = create_ui()
     theme = gr.themes.Soft(primary_hue="indigo", neutral_hue="slate")
+    port = int(os.environ.get("PORT", 7860))
+    share = os.environ.get("GRADIO_SHARE", "False").lower() in ("true", "1")
     demo.launch(
-        server_name="127.0.0.1",
-        server_port=8000,
+        server_name="0.0.0.0",
+        server_port=port,
         theme=theme,
         css=CUSTOM_CSS,
-        share=False,
+        share=share,
     )

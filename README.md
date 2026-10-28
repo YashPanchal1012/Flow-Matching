@@ -1,3 +1,13 @@
+---
+title: Flow Matching Interactive Sampler
+emoji: 🌊
+colorFrom: indigo
+colorTo: purple
+sdk: gradio
+app_file: app.py
+pinned: false
+---
+
 # Flow Matching
 
 ## 1. Installation
@@ -5,8 +15,7 @@
 ```bash
 conda create -n flow_matching python=3.10 -y
 conda activate flow_matching
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install numpy matplotlib pillow gradio tqdm
+pip install -r requirements.txt
 ```
 
 ## 2. Training Models
