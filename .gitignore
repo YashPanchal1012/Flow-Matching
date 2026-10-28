@@ -18,6 +18,7 @@ checkpoint*.pt
 # Model Checkpoints tracked via Git LFS
 !trial20-checkpoint.pt
 !mnist_classifier.pt
+!cifar10-checkpoint.pt
 !requirements.txt
 
 # Course stuff & large artifacts

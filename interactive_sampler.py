@@ -58,24 +58,25 @@ class Level(nn.Module):
 
 
 class UNet(nn.Module):
-    """Flow matching velocity field UNet for 28x28 grayscale images (Trial 20)."""
-    def __init__(self, width: int = 64, tdim: int = 32):
+    """Flow matching velocity field UNet (supports MNIST 1x28x28 and CIFAR-10 3x32x32)."""
+    def __init__(self, in_channels: int = 1, out_channels: int = 1, width: int = 64, tdim: int = 32):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         c = width
         self.register_buffer("freq", torch.exp(torch.linspace(0, math.log(1000), tdim // 2)))
         self.temb = nn.Sequential(nn.Linear(tdim, tdim), nn.SiLU(), nn.Linear(tdim, tdim))
 
-        self.down1 = Level(1, c, tdim)                    # 28 x 28
-        self.down2 = Level(c, 2 * c, tdim)                # 14 x 14
-        self.mid = Level(2 * c, 4 * c, tdim)              # 7 x 7
+        self.down1 = Level(in_channels, c, tdim)
+        self.down2 = Level(c, 2 * c, tdim)
+        self.mid = Level(2 * c, 4 * c, tdim)
         self.up2 = nn.ConvTranspose2d(4 * c, 2 * c, 2, stride=2)
         self.dec2 = Level(4 * c, 2 * c, tdim)
         self.up1 = nn.ConvTranspose2d(2 * c, c, 2, stride=2)
         self.dec1 = Level(2 * c, c, tdim)
-        self.out = nn.Conv2d(c, 1, 1)
+        self.out = nn.Conv2d(c, out_channels, 1)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        # x: B x 1 x 28 x 28, t: B x 1
         a = t * self.freq
         te = self.temb(torch.cat([a.sin(), a.cos()], 1))
         s1 = self.down1(x, te)
@@ -91,14 +92,26 @@ class UNet(nn.Module):
 # ============================================================================
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_CKPT_CANDIDATES = [
+
+# Checkpoint candidates for MNIST
+_MNIST_CANDIDATES = [
     _SCRIPT_DIR / "trial20-checkpoint.pt",
     _SCRIPT_DIR / "Report" / "Results" / "trial20-checkpoint.pt",
     _SCRIPT_DIR.parent / "Report" / "Results" / "trial20-checkpoint.pt",
     Path("trial20-checkpoint.pt"),
     Path("Report/Results/trial20-checkpoint.pt"),
 ]
-DEFAULT_CKPT = str(next((p for p in _CKPT_CANDIDATES if p.exists()), _CKPT_CANDIDATES[0]))
+DEFAULT_CKPT = str(next((p for p in _MNIST_CANDIDATES if p.exists()), _MNIST_CANDIDATES[0]))
+
+# Checkpoint candidates for CIFAR-10
+_CIFAR_CANDIDATES = [
+    _SCRIPT_DIR / "cifar10-checkpoint.pt",
+    _SCRIPT_DIR / "Report" / "Results" / "cifar10-checkpoint.pt",
+    _SCRIPT_DIR.parent / "Report" / "Results" / "cifar10-checkpoint.pt",
+    Path("cifar10-checkpoint.pt"),
+    Path("Report/Results/cifar10-checkpoint.pt"),
+]
+DEFAULT_CIFAR_CKPT = str(next((p for p in _CIFAR_CANDIDATES if p.exists()), _CIFAR_CANDIDATES[0]))
 
 _CLF_CANDIDATES = [
     _SCRIPT_DIR / "mnist_classifier.pt",
@@ -107,7 +120,6 @@ _CLF_CANDIDATES = [
 ]
 CLASSIFIER_PATH = str(next((p for p in _CLF_CANDIDATES if p.exists()), _CLF_CANDIDATES[0]))
 
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _MODEL_CACHE: Dict[str, nn.Module] = {}
 _MODEL_METADATA: Dict[str, str] = {}
 _CLASSIFIER: Optional[torch.jit.ScriptModule] = None
@@ -128,7 +140,7 @@ def get_classifier() -> Optional[torch.jit.ScriptModule]:
 
 
 def load_model(ckpt_path: str = DEFAULT_CKPT) -> Tuple[UNet, str]:
-    """Load model once and cache in memory. Respond to queries without retraining."""
+    """Load model once and cache in memory. Automatically detects MNIST or CIFAR-10 channels."""
     norm_path = os.path.abspath(ckpt_path)
     dev = get_device()
 
@@ -142,35 +154,46 @@ def load_model(ckpt_path: str = DEFAULT_CKPT) -> Tuple[UNet, str]:
     if not os.path.exists(norm_path):
         raise FileNotFoundError(f"Checkpoint not found at: {norm_path}")
 
-    print(f"[Info] Loading flow matching checkpoint from {norm_path} on {dev} (one-time load)...")
+    print(f"[Info] Loading flow matching checkpoint from {norm_path} on {dev}...")
     ckpt = torch.load(norm_path, map_location=dev)
-    model = UNet(width=64, tdim=32).to(dev)
 
     if isinstance(ckpt, dict) and "net" in ckpt:
-        model.load_state_dict(ckpt["net"])
+        state_dict = ckpt["net"]
         epoch = ckpt.get("epoch", "N/A")
         losses = ckpt.get("losses", [])
         last_loss = f"{np.mean(losses[-100:]):.4f}" if losses else "N/A"
-        meta = f"Checkpoint loaded: epoch {epoch}, final loss {last_loss}, weights: {sum(p.numel() for p in model.parameters()):,} on {dev.upper()}"
     elif isinstance(ckpt, dict):
-        model.load_state_dict(ckpt)
-        meta = f"State dict loaded: {sum(p.numel() for p in model.parameters()):,} weights on {dev.upper()}"
+        state_dict = ckpt
+        epoch, last_loss = "N/A", "N/A"
     else:
         raise ValueError("Unsupported checkpoint format.")
 
+    # Auto-detect channels (MNIST = 1, CIFAR-10 = 3)
+    in_channels = state_dict["down1.b1.c1.weight"].shape[1]
+    out_channels = state_dict["out.weight"].shape[0]
+
+    model = UNet(in_channels=in_channels, out_channels=out_channels, width=64, tdim=32).to(dev)
+    model.load_state_dict(state_dict)
     model.eval()
+
+    ds_label = "CIFAR-10 (3x32x32 RGB)" if in_channels == 3 else "MNIST (1x28x28 Grayscale)"
+    meta = f"{ds_label} loaded: epoch {epoch}, loss {last_loss}, weights: {sum(p.numel() for p in model.parameters()):,} on {dev.upper()}"
+
     _MODEL_CACHE[norm_path] = model
     _MODEL_METADATA[norm_path] = meta
     print(f"[Success] {meta}")
     return model, meta
 
 
-# Pre-load default checkpoint at module import time
+# Pre-load default checkpoints at startup
 try:
-    load_model(DEFAULT_CKPT)
+    if os.path.exists(DEFAULT_CKPT):
+        load_model(DEFAULT_CKPT)
+    if os.path.exists(DEFAULT_CIFAR_CKPT):
+        load_model(DEFAULT_CIFAR_CKPT)
     get_classifier()
 except Exception as _e:
-    print(f"[Init notice] Default checkpoint could not be auto-loaded: {_e}")
+    print(f"[Init notice] Preload notice: {_e}")
 
 
 # ============================================================================
@@ -191,12 +214,13 @@ def generate_samples(
     dev = next(model.parameters()).device
     g = torch.Generator(device=dev).manual_seed(int(seed))
 
+    in_channels = getattr(model, "in_channels", 1)
+    img_size = 32 if in_channels == 3 else 28
+
     # Initial condition at t=0: Gaussian noise x0 ~ N(0, sigma^2 * I)
-    x = torch.randn(num_samples, 1, 28, 28, generator=g, device=dev) * float(noise_scale)
+    x = torch.randn(num_samples, in_channels, img_size, img_size, generator=g, device=dev) * float(noise_scale)
 
     N = max(1, int(step_count))
-
-    # Uniform discretization grid in [0, 1]
     time_steps = [i / N for i in range(N + 1)]
 
     trajectory: List[Tuple[float, torch.Tensor]] = []
@@ -209,7 +233,6 @@ def generate_samples(
         h = t_next - t_curr
 
         t_tensor = torch.full((num_samples, 1), t_curr, device=dev, dtype=x.dtype)
-
         solver_lower = solver.lower()
 
         if "heun" in solver_lower:
@@ -240,16 +263,8 @@ def generate_samples(
 def evaluate_samples_with_classifier(
     samples_net: torch.Tensor,
 ) -> Tuple[np.ndarray, np.ndarray, float, List[int]]:
-    """
-    Evaluates generated samples with the course's pretrained classifier.
-    Returns:
-        confs: Confidence values for top predicted digit
-        preds: Predicted digit classes (0-9)
-        recognition_rate: Percentage of samples with confidence > 0.99
-        bincount: Count of each digit 0-9
-    """
+    """Evaluates generated MNIST samples with the pretrained classifier."""
     clf = get_classifier()
-    # Convert from [-1, 1] to uint8 [0, 255]
     u8 = ((samples_net[:, 0] + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8).cpu()
 
     if clf is None:
@@ -278,23 +293,20 @@ def render_grid_image(
     threshold: float = 0.99,
     scale_factor: int = 4,
 ) -> Image.Image:
-    """
-    Builds a high-resolution grid of MNIST digits.
-    Low-confidence digits (conf <= threshold) are bordered in red.
-    """
+    """Builds a high-resolution grid of images (MNIST grayscale or CIFAR-10 RGB)."""
     n = len(samples_net)
     cols = int(math.ceil(math.sqrt(n)))
     rows = int(math.ceil(n / cols))
 
-    # Base image dimensions (28x28 + borders)
-    cell_size = 28 * scale_factor
-    border_px = max(2, scale_factor // 2) if highlight_low_conf else 0
+    is_cifar = (samples_net.shape[1] == 3)
+    base_dim = 32 if is_cifar else 28
+    cell_size = base_dim * scale_factor
+    border_px = max(2, scale_factor // 2) if (highlight_low_conf and not is_cifar) else 0
     margin = 4 * scale_factor
 
     grid_w = cols * cell_size + (cols + 1) * margin
     grid_h = rows * cell_size + (rows + 1) * margin
 
-    # Dark slate background for premium look
     canvas = Image.new("RGB", (grid_w, grid_h), color=(18, 22, 34))
     draw = ImageDraw.Draw(canvas)
 
@@ -304,47 +316,53 @@ def render_grid_image(
         x_pos = margin + c * (cell_size + margin)
         y_pos = margin + r * (cell_size + margin)
 
-        # Single digit array
-        digit_arr = samples_net[idx, 0].detach().cpu().clamp(-1.0, 1.0).numpy()
-        digit_u8 = ((digit_arr + 1.0) * 127.5).astype(np.uint8)
-
-        # Upscale with nearest neighbor for sharp pixel grid
-        digit_img = Image.fromarray(digit_u8, mode="L").resize(
-            (cell_size, cell_size), resample=Image.Resampling.NEAREST
-        ).convert("RGB")
-
-        canvas.paste(digit_img, (x_pos, y_pos))
-
-        # Check confidence for highlight border
-        is_low_conf = False
-        if confs is not None and idx < len(confs):
-            if confs[idx] <= threshold:
-                is_low_conf = True
-
-        if highlight_low_conf:
-            border_color = (239, 68, 68) if is_low_conf else (34, 197, 94)  # Red vs Green
-            # Draw border
-            for b in range(border_px):
-                draw.rectangle(
-                    [x_pos - b, y_pos - b, x_pos + cell_size + b - 1, y_pos + cell_size + b - 1],
-                    outline=border_color,
-                )
-
-        # Draw predicted label badge
-        if show_labels and preds is not None and confs is not None and idx < len(preds):
-            p = preds[idx]
-            cf = confs[idx]
-            badge_text = f"{p} ({cf:.2f})"
-            # Small background box
-            draw.rectangle(
-                [x_pos + 2, y_pos + cell_size - 16, x_pos + 48, y_pos + cell_size - 2],
-                fill=(0, 0, 0, 180),
+        if is_cifar:
+            # 3-channel CIFAR-10 image [-1, 1] -> [0, 255]
+            img_tensor = samples_net[idx].detach().cpu().clamp(-1.0, 1.0)
+            img_u8 = ((img_tensor + 1.0) * 127.5).permute(1, 2, 0).numpy().astype(np.uint8)
+            cell_img = Image.fromarray(img_u8, mode="RGB").resize(
+                (cell_size, cell_size), resample=Image.Resampling.NEAREST
             )
-            draw.text(
-                (x_pos + 4, y_pos + cell_size - 15),
-                badge_text,
-                fill=(255, 255, 255),
-            )
+        else:
+            # 1-channel MNIST digit [-1, 1] -> [0, 255]
+            digit_arr = samples_net[idx, 0].detach().cpu().clamp(-1.0, 1.0).numpy()
+            digit_u8 = ((digit_arr + 1.0) * 127.5).astype(np.uint8)
+            cell_img = Image.fromarray(digit_u8, mode="L").resize(
+                (cell_size, cell_size), resample=Image.Resampling.NEAREST
+            ).convert("RGB")
+
+        canvas.paste(cell_img, (x_pos, y_pos))
+
+        if not is_cifar:
+            is_low_conf = False
+            if confs is not None and idx < len(confs):
+                if confs[idx] <= threshold:
+                    is_low_conf = True
+
+            if highlight_low_conf:
+                border_color = (239, 68, 68) if is_low_conf else (34, 197, 94)
+                for b in range(border_px):
+                    draw.rectangle(
+                        [x_pos - b, y_pos - b, x_pos + cell_size + b - 1, y_pos + cell_size + b - 1],
+                        outline=border_color,
+                    )
+
+            if show_labels and preds is not None and confs is not None and idx < len(preds):
+                p = preds[idx]
+                conf = confs[idx]
+                badge_text = f"{p} ({conf:.2f})"
+                badge_bg = (239, 68, 68) if is_low_conf else (34, 197, 94)
+                badge_pad = 2 * scale_factor
+                try:
+                    font = ImageFont.load_default()
+                except Exception:
+                    font = None
+                bbox = draw.textbbox((0, 0), badge_text, font=font) if font else (0, 0, 40, 10)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                bx1, by1 = x_pos + 2, y_pos + 2
+                bx2, by2 = bx1 + tw + 2 * badge_pad, by1 + th + 2 * badge_pad
+                draw.rectangle([bx1, by1, bx2, by2], fill=badge_bg)
+                draw.text((bx1 + badge_pad, by1 + badge_pad), badge_text, fill=(255, 255, 255), font=font)
 
     return canvas
 
@@ -354,46 +372,50 @@ def render_trajectory_filmstrip(
     sample_index: int = 0,
     scale_factor: int = 4,
 ) -> Image.Image:
-    """
-    Renders horizontal evolution of a selected sample from noise (t=0) to digit (t=1).
-    """
+    """Builds a horizontal filmstrip showing the sample evolving across time."""
     if not trajectory:
-        return Image.new("RGB", (100, 100), color=(20, 20, 20))
+        return Image.new("RGB", (100, 100), (20, 20, 30))
 
-    cell_size = 28 * scale_factor
-    margin = 8
-    header_h = 24
-    num_snaps = len(trajectory)
+    first_tensor = trajectory[0][1]
+    is_cifar = (first_tensor.shape[1] == 3)
+    base_dim = 32 if is_cifar else 28
+    cell_size = base_dim * scale_factor
+    n_frames = len(trajectory)
+    margin = 4 * scale_factor
+    label_h = 24
 
-    strip_w = num_snaps * cell_size + (num_snaps + 1) * margin
-    strip_h = cell_size + margin * 2 + header_h
+    strip_w = n_frames * cell_size + (n_frames + 1) * margin
+    strip_h = cell_size + 2 * margin + label_h
 
-    strip = Image.new("RGB", (strip_w, strip_h), color=(24, 28, 42))
+    strip = Image.new("RGB", (strip_w, strip_h), color=(18, 22, 34))
     draw = ImageDraw.Draw(strip)
 
-    for i, (t_val, snapshot) in enumerate(trajectory):
-        idx = min(sample_index, len(snapshot) - 1)
+    for i, (t_val, tensor) in enumerate(trajectory):
         x_pos = margin + i * (cell_size + margin)
-        y_pos = margin + header_h
+        y_pos = margin
 
-        img_arr = snapshot[idx, 0].detach().cpu().clamp(-1.0, 1.0).numpy()
-        img_u8 = ((img_arr + 1.0) * 127.5).astype(np.uint8)
-        img_pil = Image.fromarray(img_u8, mode="L").resize(
-            (cell_size, cell_size), resample=Image.Resampling.NEAREST
-        ).convert("RGB")
+        if is_cifar:
+            arr = tensor[sample_index].detach().cpu().clamp(-1.0, 1.0)
+            u8 = ((arr + 1.0) * 127.5).permute(1, 2, 0).numpy().astype(np.uint8)
+            img = Image.fromarray(u8, mode="RGB").resize(
+                (cell_size, cell_size), resample=Image.Resampling.NEAREST
+            )
+        else:
+            arr = tensor[sample_index, 0].detach().cpu().clamp(-1.0, 1.0).numpy()
+            u8 = ((arr + 1.0) * 127.5).astype(np.uint8)
+            img = Image.fromarray(u8, mode="L").resize(
+                (cell_size, cell_size), resample=Image.Resampling.NEAREST
+            ).convert("RGB")
 
-        strip.paste(img_pil, (x_pos, y_pos))
+        strip.paste(img, (x_pos, y_pos))
 
-        # Time label
-        label = f"t = {t_val:.2f}"
-        draw.text((x_pos + 4, 4), label, fill=(190, 200, 220))
-
-        # Accent border
-        draw.rectangle(
-            [x_pos, y_pos, x_pos + cell_size - 1, y_pos + cell_size - 1],
-            outline=(79, 70, 229),
-            width=2,
-        )
+        t_text = f"t = {t_val:.2f}"
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+        draw.text((x_pos + 4, y_pos + cell_size + 4), t_text, fill=(203, 213, 225), font=font)
+        draw.rectangle([x_pos, y_pos, x_pos + cell_size - 1, y_pos + cell_size - 1], outline=(99, 102, 241), width=2)
 
     return strip
 
@@ -404,6 +426,7 @@ def render_trajectory_filmstrip(
 
 @spaces.GPU
 def run_sampler(
+    dataset_choice: str,
     seed: int,
     step_count: int,
     solver: str,
@@ -415,17 +438,18 @@ def run_sampler(
     ckpt_path: str,
     uploaded_ckpt: Optional[Any] = None,
 ) -> Tuple[Image.Image, Optional[Image.Image], str, str]:
-    """
-    Main callback invoked by Gradio. Loads checkpoint once, generates samples,
-    and returns visualized grid, metrics, and optional trajectory filmstrip.
-    """
+    """Main callback invoked by Gradio."""
     start_time = time.time()
+
+    is_cifar = "cifar" in dataset_choice.lower()
 
     # Determine which checkpoint to use
     if uploaded_ckpt is not None:
         target_path = uploaded_ckpt.name if hasattr(uploaded_ckpt, "name") else str(uploaded_ckpt)
+    elif is_cifar:
+        target_path = DEFAULT_CIFAR_CKPT
     else:
-        target_path = ckpt_path
+        target_path = ckpt_path if ckpt_path else DEFAULT_CKPT
 
     # 1. Fetch model from cache (load once)
     try:
@@ -435,7 +459,7 @@ def run_sampler(
         empty_img = Image.new("RGB", (200, 200), color=(40, 20, 20))
         return empty_img, None, err_msg, ""
 
-    # Ensure model is on active device (moves to CUDA inside @spaces.GPU)
+    # Ensure model is on active device
     dev = get_device()
     first_p = next(model.parameters(), None)
     if first_p is not None and first_p.device.type != dev:
@@ -459,8 +483,30 @@ def run_sampler(
 
     latency_ms = (time.time() - start_time) * 1000.0
 
-    # 3. Evaluate with pretrained course classifier
-    confs, preds, rec_rate, counts = evaluate_samples_with_classifier(samples_net)
+    # 3. Diagnostics
+    confs, preds = None, None
+    if not is_cifar and samples_net.shape[1] == 1:
+        confs, preds, rec_rate, counts = evaluate_samples_with_classifier(samples_net)
+        low_conf_count = int(np.sum(confs <= 0.99))
+        metrics_markdown = f"""
+### Sampling Diagnostics (MNIST)
+- **Model**: `MNIST Flow Matching (Trial 20)`
+- **Recognition Score (Conf > 0.99)**: `{rec_rate * 100:.1f}%`
+- **Low-Confidence Samples (<= 0.99)**: `{low_conf_count} / {len(samples_net)}` *(red borders in grid)*
+- **Integration Latency**: `{latency_ms:.1f} ms` on `{get_device().upper()}`
+- **Sampler**: `{solver}` with `{step_count}` steps | Noise σ = `{noise_scale}`
+- **Digit Counts [0-9]**: `{counts}`
+"""
+    else:
+        grid_dim = int(math.isqrt(len(samples_net)))
+        metrics_markdown = f"""
+### Sampling Diagnostics (CIFAR-10)
+- **Model**: `CIFAR-10 Flow Matching U-Net`
+- **Channels & Resolution**: `3 channels (RGB) · 32 x 32`
+- **Integration Latency**: `{latency_ms:.1f} ms` on `{get_device().upper()}`
+- **Sampler**: `{solver}` with `{step_count}` steps | Noise σ = `{noise_scale}`
+- **Samples Grid**: `{len(samples_net)}` images ({grid_dim}x{grid_dim})
+"""
 
     # 4. Render main grid
     grid_img = render_grid_image(
@@ -478,20 +524,7 @@ def run_sampler(
     if show_trajectory and trajectory:
         traj_img = render_trajectory_filmstrip(trajectory, sample_index=0, scale_factor=4)
 
-    # 6. Format metrics
-    low_conf_count = int(np.sum(confs <= 0.99))
-    full_cov = all(c >= 1 for c in counts) if len(samples_net) >= 10 else "N/A"
-
-    metrics_markdown = f"""
-### Sampling Diagnostics
-- **Recognition Score (Conf > 0.99)**: `{rec_rate * 100:.1f}%`
-- **Low-Confidence Samples (<= 0.99)**: `{low_conf_count} / {len(samples_net)}` *(red borders in grid)*
-- **Integration Latency**: `{latency_ms:.1f} ms` on `{get_device().upper()}`
-- **Sampler**: `{solver}` with `{step_count}` steps | Noise σ = `{noise_scale}`
-- **Digit Counts [0-9]**: `{counts}`
-    """
-
-    status_badge = f"Generated {len(samples_net)} samples in {latency_ms:.1f}ms ({solver}, N={step_count}, Seed={seed})"
+    status_badge = f"Generated {len(samples_net)} samples in {latency_ms:.1f}ms ({solver}, N={step_count}, Seed={seed}) on {dataset_choice.split()[0]}"
     return grid_img, traj_img, metrics_markdown, status_badge
 
 
@@ -536,12 +569,6 @@ body, .gradio-container {
     border-radius: 12px !important;
     padding: 16px !important;
 }
-.stat-box {
-    background: #1f2937;
-    border-radius: 8px;
-    padding: 12px;
-    border-left: 4px solid #6366f1;
-}
 """
 
 def create_ui() -> gr.Blocks:
@@ -550,8 +577,11 @@ def create_ui() -> gr.Blocks:
         gr.HTML("""
         <div class="header-box">
             <h1 style="margin: 0; font-size: 28px; font-weight: 700; display: flex; align-items: center; gap: 10px;">
-                Flow Matching Interactive Sampler
+                🌊 Flow Matching Interactive Sampler
             </h1>
+            <p style="margin: 6px 0 0 0; opacity: 0.9; font-size: 14px;">
+                Simulate continuous velocity fields using Euler and Heun ODE solvers across MNIST Digits and CIFAR-10 Color Images.
+            </p>
         </div>
         """)
 
@@ -559,6 +589,14 @@ def create_ui() -> gr.Blocks:
             # ----------------- Left: Control Panel -----------------
             with gr.Column(scale=4, elem_classes=["control-card"]):
                 gr.Markdown("### Sampler Controls")
+
+                # Dataset Selector
+                dataset_radio = gr.Radio(
+                    choices=["MNIST (28x28 Grayscale)", "CIFAR-10 (32x32 RGB)"],
+                    value="MNIST (28x28 Grayscale)",
+                    label="Select Dataset / Model",
+                    info="Switch between MNIST Handwritten Digits and CIFAR-10 Natural Color Images",
+                )
 
                 # Checkpoint Accordion
                 with gr.Accordion("📁 Model Checkpoint Settings", open=False):
@@ -632,12 +670,12 @@ def create_ui() -> gr.Blocks:
                     with gr.Row():
                         highlight_box = gr.Checkbox(
                             value=True,
-                            label="Highlight Low Confidence (≤ 0.99)",
+                            label="Highlight Low Confidence (MNIST)",
                             info="Red border if classifier conf ≤ 0.99",
                         )
                         labels_box = gr.Checkbox(
                             value=True,
-                            label="Show Predicted Digit Badges",
+                            label="Show Predicted Digit Badges (MNIST)",
                             info="Overlays digit & confidence",
                         )
                     trajectory_box = gr.Checkbox(
@@ -657,7 +695,7 @@ def create_ui() -> gr.Blocks:
                     with gr.TabItem("Generated Samples Grid"):
                         gr.Markdown(
                             "<p style='margin: 4px 0 6px 0; font-size: 13px; color: #94a3b8;'>"
-                            "Generated MNIST Digits &bull; <span style='color: #ef4444; font-weight: 600;'>Red border</span> indicates classifier confidence &le; 0.99"
+                            "Generated Samples &bull; MNIST Digits or CIFAR-10 RGB"
                             "</p>"
                         )
                         grid_output = gr.Image(
@@ -669,7 +707,7 @@ def create_ui() -> gr.Blocks:
                     with gr.TabItem("Flow Trajectory (t: 0 → 1)"):
                         gr.Markdown(
                             "<p style='margin: 4px 0 6px 0; font-size: 13px; color: #94a3b8;'>"
-                            "Reverse Vector Field Trajectory Evolution (t = 0 Noise &rarr; t = 1 Digit)"
+                            "Reverse Vector Field Trajectory Evolution (t = 0 Noise &rarr; t = 1 Sample)"
                             "</p>"
                         )
                         traj_output = gr.Image(
@@ -681,9 +719,6 @@ def create_ui() -> gr.Blocks:
                 metrics_output = gr.Markdown(
                     value="""
 ### Sampling Diagnostics
-- **Recognition Score (Conf > 0.99)**: `--%`
-- **Low-Confidence Samples**: `--`
-- **Integration Latency**: `-- ms`
 - Click **Generate Samples** to evaluate.
                     """
                 )
@@ -694,6 +729,18 @@ def create_ui() -> gr.Blocks:
             return random.randint(0, 99999)
 
         randomize_btn.click(fn=randomize_seed, outputs=seed_slider)
+
+        def on_dataset_change(choice):
+            if "cifar" in choice.lower():
+                return DEFAULT_CIFAR_CKPT, f"Device: `{get_device().upper()}` | Selected: `CIFAR-10`"
+            else:
+                return DEFAULT_CKPT, f"Device: `{get_device().upper()}` | Selected: `MNIST`"
+
+        dataset_radio.change(
+            fn=on_dataset_change,
+            inputs=[dataset_radio],
+            outputs=[ckpt_input, ckpt_status],
+        )
 
         def handle_ckpt_upload(uploaded_file):
             if not uploaded_file:
@@ -717,20 +764,23 @@ def create_ui() -> gr.Blocks:
             outputs=[ckpt_status],
         )
 
+        sampler_inputs = [
+            dataset_radio,
+            seed_slider,
+            step_slider,
+            solver_dropdown,
+            noise_slider,
+            samples_dropdown,
+            highlight_box,
+            labels_box,
+            trajectory_box,
+            ckpt_input,
+            ckpt_upload,
+        ]
+
         generate_btn.click(
             fn=run_sampler,
-            inputs=[
-                seed_slider,
-                step_slider,
-                solver_dropdown,
-                noise_slider,
-                samples_dropdown,
-                highlight_box,
-                labels_box,
-                trajectory_box,
-                ckpt_input,
-                ckpt_upload,
-            ],
+            inputs=sampler_inputs,
             outputs=[
                 grid_output,
                 traj_output,
@@ -742,18 +792,7 @@ def create_ui() -> gr.Blocks:
         # Trigger generation on load
         demo.load(
             fn=run_sampler,
-            inputs=[
-                seed_slider,
-                step_slider,
-                solver_dropdown,
-                noise_slider,
-                samples_dropdown,
-                highlight_box,
-                labels_box,
-                trajectory_box,
-                ckpt_input,
-                ckpt_upload,
-            ],
+            inputs=sampler_inputs,
             outputs=[
                 grid_output,
                 traj_output,
@@ -766,7 +805,6 @@ def create_ui() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    # Standalone entrypoint
     demo = create_ui()
     theme = gr.themes.Soft(primary_hue="indigo", neutral_hue="slate")
     port = int(os.environ.get("PORT", 7860))
